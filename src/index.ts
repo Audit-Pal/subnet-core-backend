@@ -1,25 +1,18 @@
-import express, { Application, Request, Response } from 'express';
-import dotenv from 'dotenv';
-import auditRoutes from "./routes/audit";
+import express from "express";
+import serverless from "serverless-http";
+import dotenv from "dotenv";
 import mongoose from "mongoose";
-// For environment variables
+import auditRoutes from "./routes/audit";
+
 dotenv.config();
 
-const app: Application = express();
-const PORT = process.env.PORT || 3000;
-
+const app = express();
 app.use(express.json());
 
-app.get('/', (req: Request, res: Response) => {
-  res.send('Welcome to Express & TypeScript Server');
-});
-
-mongoose.connect(process.env.MONGO_URI || "mongodb://localhost:27017/audits")
+mongoose.connect(process.env.MONGO_URI!)
   .then(() => console.log("Mongo connected"))
   .catch(console.error);
 
 app.use("/api/audits", auditRoutes);
 
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-});
+export default serverless(app);
