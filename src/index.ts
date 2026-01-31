@@ -1,18 +1,7 @@
-import express from "express";
-import serverless from "serverless-http";
-import dotenv from "dotenv";
-import mongoose from "mongoose";
-import auditRoutes from "./routes/audit";
+import app from './api/index';
 
-dotenv.config();
+const PORT = process.env.PORT || 3000;
 
-const app = express();
-app.use(express.json());
-
-mongoose.connect(process.env.MONGO_URI!)
-  .then(() => console.log("Mongo connected"))
-  .catch(console.error);
-
-app.use("/api/audits", auditRoutes);
-
-export default serverless(app);
+app.listen(PORT, () => {
+  console.log(`Server is running on http://localhost:${PORT}`);
+});
