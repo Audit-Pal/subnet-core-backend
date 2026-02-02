@@ -1,37 +1,50 @@
 {
-  "name": "subnet-core-backend",
+  "name": "subnet-validator-backend",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Express backend for tracking Bittensor subnet validation processes",
+  "main": "dist/server.js",
   "scripts": {
-    "dev": "ts-node server.ts",
+    "dev": "ts-node src/server.ts",
     "build": "tsc",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "watch": "tsc --watch",
+    "dev:watch": "concurrently \"npm run watch\" \"nodemon dist/server.js\"",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write src/**/*.ts"
   },
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/Audit-Pal/subnet-core-backend.git"
-  },
-  "keywords": [],
+  "keywords": [
+    "bittensor",
+    "subnet",
+    "validator",
+    "tracking",
+    "express",
+    "typescript",
+    "mongodb"
+  ],
   "author": "",
-  "license": "ISC",
-  "type": "commonjs",
-  "bugs": {
-    "url": "https://github.com/Audit-Pal/subnet-core-backend/issues"
-  },
-  "homepage": "https://github.com/Audit-Pal/subnet-core-backend#readme",
+  "license": "MIT",
   "dependencies": {
-    "dotenv": "^17.2.3",
-    "express": "^5.2.1",
-    "mongoose": "^9.1.5",
-    "serverless-http": "^4.0.0",
-    "zod": "^4.3.6"
+    "express": "^4.18.2",
+    "mongoose": "^7.0.0",
+    "cors": "^2.8.5",
+    "uuid": "^9.0.0",
+    "dotenv": "^16.0.3"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
-    "@types/node": "^25.1.0",
-    "nodemon": "^3.1.11",
-    "ts-node": "^10.9.2",
-    "typescript": "^5.9.3"
+    "typescript": "^5.0.0",
+    "ts-node": "^10.9.1",
+    "@types/express": "^4.17.17",
+    "@types/node": "^20.0.0",
+    "@types/cors": "^2.8.13",
+    "@types/uuid": "^9.0.2",
+    "nodemon": "^2.0.22",
+    "concurrently": "^8.0.0",
+    "eslint": "^8.40.0",
+    "@typescript-eslint/eslint-plugin": "^5.59.0",
+    "@typescript-eslint/parser": "^5.59.0",
+    "prettier": "^2.8.8"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }
