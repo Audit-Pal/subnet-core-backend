@@ -370,45 +370,7 @@ app.post('/api/validation/:sessionId/challenge', async (req: Request, res: Respo
   }
 });
 
-/**
- * POST /api/validation/:sessionId/ground-truth
- * Record ground truth data
- */
-app.post('/api/validation/:sessionId/ground-truth', async (req: Request, res: Response): Promise<void> => {
-  try {
-    const { sessionId } = req.params;
-    const { reportId, vulnerabilities, criticalIssues, rawData } = req.body;
 
-    const session = await ValidationSession.findOneAndUpdate(
-      { sessionId },
-      {
-        $set: {
-          'groundTruth.reportId': reportId,
-          'groundTruth.vulnerabilities': vulnerabilities || [],
-          'groundTruth.criticalIssues': criticalIssues,
-          'groundTruth.rawData': rawData
-        }
-      },
-      { new: true }
-    );
-
-    if (!session) {
-      res.status(404).json({ success: false, error: 'Session not found' });
-      return;
-    }
-
-    res.json({
-      success: true,
-      message: 'Ground truth recorded'
-    });
-  } catch (error: any) {
-    console.error('Error in POST /api/validation/:sessionId/ground-truth:', error);
-    res.status(500).json({
-      success: false,
-      error: error.message || 'Internal server error'
-    });
-  }
-});
 
 /**
  * POST /api/validation/:sessionId/miner-response
@@ -1186,6 +1148,228 @@ app.get('/api/docs', (_req: Request, res: Response): void => {
   };
 
   res.json(docs);
+});
+
+// =====================
+// NETWORK DASHBOARD ENDPOINTS
+// Add these routes to your existing server.ts BEFORE the error handlers
+// =====================
+
+/**
+ * GET /api/network/stats
+ * Returns top-level stats for the Network Status dashboard:
+ *  - activeValidators
+ *  - activeMiners
+ *  - dailyAudits   (completed sessions in last 24 h)
+ *  - avgAccuracy   (average reward/accuracy score across all recent miner history)
+ *
+ * Query params:
+ *  - window  : lookback window for "daily" stats  (default: "24h", options: "7d" | "30d")
+ */
+app.get('/api/network/stats', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { window: tw = '24h' } = req.query;
+
+    const since = new Date();
+    if (tw === '7d')       since.setDate(since.getDate() - 7);
+    else if (tw === '30d') since.setDate(since.getDate() - 30);
+    else                   since.setHours(since.getHours() - 24);
+
+    // Pull the most recent subnet snapshot from any session
+    const latestSession = await ValidationSession
+      .findOne({ 'subnetSnapshot.block': { $exists: true } })
+      .sort({ timestamp: -1 })
+      .lean();
+
+    const snap = (latestSession as any)?.subnetSnapshot;
+
+    // Daily audits = completed sessions in the window
+    const dailyAudits = await ValidationSession.countDocuments({
+      state: 'completed',
+      timestamp: { $gte: since }
+    });
+
+    // Average accuracy across all miner history in the window
+    const accAgg = await MinerHistory.aggregate([
+      { $match: { timestamp: { $gte: since } } },
+      {
+        $group: {
+          _id: null,
+          avgAccuracy: { $avg: '$rewardScore' }
+        }
+      }
+    ]);
+
+    res.json({
+      success: true,
+      data: {
+        activeValidators: snap?.activeValidators ?? 0,
+        activeMiners:     snap?.activeMiners     ?? 0,
+        dailyAudits,
+        avgAccuracy: Number((accAgg[0]?.avgAccuracy ?? 0).toFixed(4))
+      }
+    });
+  } catch (error: any) {
+    console.error('Error in GET /api/network/stats:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+/**
+ * GET /api/network/agents
+ * Returns the Top Agents table data for the Network Status dashboard.
+ *
+ * Each row contains:
+ *  - rank
+ *  - minerUid
+ *  - githubUrl   (agent repo — most recently seen URL for that miner)
+ *  - benchmark   (avg reward score, shown as a 0-100 score)
+ *  - incentive   (total accumulated reward score)
+ *  - emission    (participation count acts as a proxy for emission weight)
+ *  - consensus   (success rate %)
+ *
+ * Query params:
+ *  - limit     : number of agents to return  (default: 50)
+ *  - timeRange : lookback window             (default: "30d", options: "24h" | "7d")
+ */
+app.get('/api/network/agents', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { limit = '50', timeRange = '30d' } = req.query;
+
+    const since = new Date();
+    if (timeRange === '24h')     since.setHours(since.getHours() - 24);
+    else if (timeRange === '7d') since.setDate(since.getDate() - 7);
+    else                         since.setDate(since.getDate() - 30);
+
+    // Aggregate per-miner stats from MinerHistory
+    const agentStats = await MinerHistory.aggregate([
+      { $match: { timestamp: { $gte: since } } },
+      {
+        $group: {
+          _id: '$minerUid',
+          avgReward:         { $avg: '$rewardScore' },
+          totalReward:       { $sum: '$rewardScore' },
+          participationCount:{ $sum: 1 },
+          successCount: {
+            $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] }
+          },
+          // Keep the most recent githubUrl
+          latestSessionId: { $last: '$sessionId' }
+        }
+      },
+      { $sort: { avgReward: -1 } },
+      { $limit: parseInt(limit as string) }
+    ]);
+
+    // Look up githubUrls from ValidationSession for each miner
+    const sessionIds = agentStats.map((a: any) => a.latestSessionId).filter(Boolean);
+    const sessions = await ValidationSession
+      .find({ sessionId: { $in: sessionIds } }, { sessionId: 1, minerResponses: 1 })
+      .lean();
+
+    const sessionMap: Record<string, any> = {};
+    for (const s of sessions) {
+      sessionMap[(s as any).sessionId] = s;
+    }
+
+    const agents = agentStats.map((entry: any, idx: number) => {
+      const sess = sessionMap[entry.latestSessionId];
+      const minerResp = sess?.minerResponses?.find(
+        (r: any) => r.minerUid === entry._id
+      );
+
+      const successRate = entry.participationCount > 0
+        ? (entry.successCount / entry.participationCount) * 100
+        : 0;
+
+      return {
+        rank:             idx + 1,
+        minerUid:         entry._id,
+        agent:            minerResp?.githubUrl ?? null,
+        benchmark:        Number((entry.avgReward * 100).toFixed(2)),   // 0–100 scale
+        incentive:        Number(entry.totalReward.toFixed(6)),
+        emission:         entry.participationCount,                      // proxy
+        consensus:        Number(successRate.toFixed(2))
+      };
+    });
+
+    res.json({
+      success: true,
+      timeRange,
+      data: agents
+    });
+  } catch (error: any) {
+    console.error('Error in GET /api/network/agents:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+/**
+ * GET /api/network/throughput
+ * Returns time-series data for the "Global Audit Throughput" chart.
+ *
+ * Each data point: { timestamp, completedSessions, avgRewardScore }
+ *
+ * Query params:
+ *  - timeRange  : "24h" | "7d" | "30d"   (default: "7d")
+ *  - buckets    : number of data points   (default: 24 for 24h, 7 for 7d, 30 for 30d)
+ */
+app.get('/api/network/throughput', async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { timeRange = '7d' } = req.query;
+
+    const since = new Date();
+    let bucketMs: number;
+
+    if (timeRange === '24h') {
+      since.setHours(since.getHours() - 24);
+      bucketMs = 60 * 60 * 1000;           // 1-hour buckets
+    } else if (timeRange === '30d') {
+      since.setDate(since.getDate() - 30);
+      bucketMs = 24 * 60 * 60 * 1000;      // 1-day buckets
+    } else {
+      // 7d default
+      since.setDate(since.getDate() - 7);
+      bucketMs = 6 * 60 * 60 * 1000;       // 6-hour buckets
+    }
+
+    const series = await ValidationSession.aggregate([
+      { $match: { timestamp: { $gte: since }, state: 'completed' } },
+      {
+        $group: {
+          _id: {
+            $subtract: [
+              { $toLong: '$timestamp' },
+              { $mod: [{ $toLong: '$timestamp' }, bucketMs] }
+            ]
+          },
+          completedSessions: { $sum: 1 },
+          avgRewardScore:    { $avg: '$metrics.averageRewardScore' }
+        }
+      },
+      { $sort: { _id: 1 } },
+      {
+        $project: {
+          _id: 0,
+          timestamp:         { $toDate: '$_id' },
+          completedSessions: 1,
+          avgRewardScore:    { $ifNull: ['$avgRewardScore', 0] }
+        }
+      }
+    ]);
+
+    res.json({
+      success: true,
+      timeRange,
+      bucketMs,
+      data: series
+    });
+  } catch (error: any) {
+    console.error('Error in GET /api/network/throughput:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
 });
 
 // =====================
