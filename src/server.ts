@@ -51,12 +51,6 @@ interface ChallengeInfo {
   rawData?: Record<string, any>;
 }
 
-interface GroundTruth {
-  reportId: string;
-  vulnerabilities: string[];
-  criticalIssues?: number;
-  rawData?: Record<string, any>;
-}
 
 interface SubnetSnapshot {
   netuid: number;
@@ -85,7 +79,6 @@ interface ValidationSessionDocument extends Document {
   sampledMinerCount: number;
   sampledMinerUids: number[];
   challengeInfo: ChallengeInfo;
-  groundTruth: GroundTruth;
   minerResponses: MinerResponse[];
   computedRewards: Array<{ minerUid: number; score: number; timestamp: Date }>;
   metrics: ValidationMetrics;
@@ -154,13 +147,7 @@ const validationSessionSchema = new Schema<ValidationSessionDocument>({
     rawData: Schema.Types.Mixed
   },
 
-  // Ground truth
-  groundTruth: {
-    reportId: String,
-    vulnerabilities: [String],
-    criticalIssues: Number,
-    rawData: Schema.Types.Mixed
-  },
+ 
 
   // Miner responses and rewards
   minerResponses: [{
