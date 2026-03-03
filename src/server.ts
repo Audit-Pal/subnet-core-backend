@@ -58,12 +58,11 @@ app.use(cors({
 // =====================
 // BODY PARSING — tight size limit
 // =====================
-app.use(express.json({ limit: '1mb' }));        // was 50mb — no endpoint needs that
+app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ limit: '1mb', extended: true }));
 
 // =====================
 // MONGO INJECTION SANITIZATION
-// Strips $ and . from req.body, req.params, req.query
 // =====================
 app.use(mongoSanitize());
 
@@ -74,7 +73,6 @@ app.use((req: Request, res: Response, next: NextFunction) => {
   const start = Date.now();
   res.on('finish', () => {
     const duration = Date.now() - start;
-    // Never log body — could contain sensitive data
     console.log(`[${new Date().toISOString()}] ${req.method} ${req.path} - ${res.statusCode} - ${duration}ms`);
   });
   next();
@@ -84,25 +82,22 @@ app.use((req: Request, res: Response, next: NextFunction) => {
 // RATE LIMITERS
 // =====================
 
-// Strict limiter for session creation (write-heavy, expensive)
 const startSessionLimiter = rateLimit({
   windowMs: 60_000,
-  max: 10,                          // 10 new sessions per minute per IP
+  max: 10,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, error: 'Too many session requests, slow down.' }
 });
 
-// General write limiter for session sub-routes
 const writeLimiter = rateLimit({
   windowMs: 60_000,
-  max: 120,                         // 2/sec average
+  max: 120,
   standardHeaders: true,
   legacyHeaders: false,
   message: { success: false, error: 'Too many requests.' }
 });
 
-// Relaxed limiter for read endpoints (dashboard polling)
 const readLimiter = rateLimit({
   windowMs: 60_000,
   max: 300,
@@ -115,10 +110,6 @@ const readLimiter = rateLimit({
 // AUTH MIDDLEWARE
 // =====================
 
-/**
- * requireApiKey — verifies x-api-key header matches API_KEY env var.
- * Applied to all write (POST) endpoints.
- */
 const requireApiKey = (req: Request, res: Response, next: NextFunction): void => {
   const key = req.headers['x-api-key'];
   if (!key || key !== API_KEY) {
@@ -128,11 +119,6 @@ const requireApiKey = (req: Request, res: Response, next: NextFunction): void =>
   next();
 };
 
-/**
- * verifySessionOwner — after requireApiKey, checks that the requesting
- * validator is the one who created this session.
- * Reads validatorAddress from req.body and compares against session metadata.
- */
 const verifySessionOwner = async (
   req: Request,
   res: Response,
@@ -172,26 +158,88 @@ const verifySessionOwner = async (
 // INPUT VALIDATORS
 // =====================
 
-/** Reject strings over maxLen to prevent oversized payloads slipping through */
 const safeStr = (val: unknown, maxLen = 512): string | undefined => {
   if (typeof val !== 'string') return undefined;
   return val.slice(0, maxLen);
 };
 
-/** Clamp a number to a safe range */
 const safeNum = (val: unknown, min = 0, max = Number.MAX_SAFE_INTEGER): number | undefined => {
   const n = Number(val);
   if (!isFinite(n)) return undefined;
   return Math.min(Math.max(n, min), max);
 };
 
-/** Validate reward score is a real number in [0, 1] */
 const isValidScore = (val: unknown): val is number =>
   typeof val === 'number' && isFinite(val) && val >= 0 && val <= 1;
 
 // =====================
+// VULNERABILITY FINDINGS VALIDATOR
+// =====================
+
+const validateAgentFindings = (agentFindings: any) => {
+  if (!agentFindings || typeof agentFindings !== 'object') {
+    return undefined;
+  }
+
+  const VALID_SEVERITIES = ['critical', 'high', 'medium', 'low', 'info'];
+  const MAX_FINDINGS = 500;
+
+  const findings = Array.isArray(agentFindings.findings)
+    ? agentFindings.findings.slice(0, MAX_FINDINGS)
+    : [];
+
+  const cleanFindings = findings
+    .filter((f: any) => f && typeof f === 'object')
+    .map((f: any) => ({
+      id: safeStr(f.id, 64) || uuidv4().slice(0, 8),
+      title: safeStr(f.title, 256) || 'Unknown Finding',
+      severity: VALID_SEVERITIES.includes(f.severity) ? f.severity : 'medium',
+      description: safeStr(f.description, 2048),
+      codeLocation: safeStr(f.codeLocation, 256),
+      remediation: safeStr(f.remediation, 2048),
+      confidenceScore: safeNum(f.confidenceScore, 0, 1)
+    }));
+
+  const breakdown = {
+    critical: cleanFindings.filter((f: any) => f.severity === 'critical').length,
+    high: cleanFindings.filter((f: any) => f.severity === 'high').length,
+    medium: cleanFindings.filter((f: any) => f.severity === 'medium').length,
+    low: cleanFindings.filter((f: any) => f.severity === 'low').length,
+    info: cleanFindings.filter((f: any) => f.severity === 'info').length
+  };
+
+  return {
+    findingsCount: cleanFindings.length,
+    criticalCount: breakdown.critical,
+    highCount: breakdown.high,
+    mediumCount: breakdown.medium,
+    lowCount: breakdown.low,
+    findings: cleanFindings
+  };
+};
+
+// =====================
 // INTERFACES
 // =====================
+
+interface AgentFinding {
+  id: string;
+  title: string;
+  severity: 'critical' | 'high' | 'medium' | 'low' | 'info';
+  description?: string;
+  codeLocation?: string;
+  remediation?: string;
+  confidenceScore?: number;
+}
+
+interface AgentFindingsData {
+  findingsCount: number;
+  criticalCount: number;
+  highCount: number;
+  mediumCount: number;
+  lowCount: number;
+  findings: AgentFinding[];
+}
 
 interface MinerResponse {
   minerUid: number;
@@ -206,6 +254,7 @@ interface MinerResponse {
     accuracy?: number;
     completionStatus?: string;
   };
+  agentFindings?: AgentFindingsData;
   rewardScore?: number;
   rewardReason?: string;
 }
@@ -269,6 +318,7 @@ interface MinerHistoryDocument extends Document {
   rewardScore: number;
   githubUrl?: string;
   findingsCount?: number;
+  criticalFindingsCount?: number;
   accuracy?: number;
   executionTime?: number;
   timestamp: Date;
@@ -288,6 +338,30 @@ interface RewardUpdateDocument extends Document {
 // =====================
 // DATABASE SCHEMAS
 // =====================
+const agentFindingSchema = new Schema(
+  {
+    id: { type: String },
+    title: { type: String },
+    severity: {
+      type: String,
+      enum: ['critical', 'high', 'medium', 'low', 'info']
+    },
+    description: { type: String },
+    codeLocation: { type: String },
+    remediation: { type: String },
+    confidenceScore: { type: Number }
+  },
+  { _id: false }
+);
+
+const agentFindingsDataSchema = new Schema({
+  findingsCount: { type: Number },
+  criticalCount: { type: Number },
+  highCount: { type: Number },
+  mediumCount: { type: Number },
+  lowCount: { type: Number },
+  findings: [agentFindingSchema]
+});
 
 const validationSessionSchema = new Schema<ValidationSessionDocument>({
   sessionId: { type: String, required: true, unique: true, index: true },
@@ -299,77 +373,79 @@ const validationSessionSchema = new Schema<ValidationSessionDocument>({
     enum: ['pending', 'in-progress', 'completed', 'failed'],
     default: 'pending'
   },
-  sampledMinerCount: Number,
-  sampledMinerUids: [Number],
+  sampledMinerCount: { type: Number },
+  sampledMinerUids: [{ type: Number }],
   challengeInfo: {
-    projectId: String,
-    description: String,
-    difficulty: String,
-    createdAt: Date,
+    projectId: { type: String },
+    description: { type: String },
+    difficulty: { type: String },
+    createdAt: { type: Date },
     rawData: Schema.Types.Mixed
   },
   minerResponses: [{
-    minerUid: Number,
-    githubUrl: String,
-    responseTime: Number,
-    success: Boolean,
-    errorMessage: String,
-    timestamp: Date,
+    minerUid: { type: Number },
+    githubUrl: { type: String },
+    responseTime: { type: Number },
+    success: { type: Boolean },
+    errorMessage: { type: String },
+    timestamp: { type: Date },
     agentPerformance: {
-      executionTime: Number,
-      findingsCount: Number,
-      accuracy: Number,
-      completionStatus: String
+      executionTime: { type: Number },
+      findingsCount: { type: Number },
+      accuracy: { type: Number },
+      completionStatus: { type: String }
     },
-    rewardScore: Number,
-    rewardReason: String,
+    agentFindings: agentFindingsDataSchema,
+    rewardScore: { type: Number },
+    rewardReason: { type: String },
     _id: false
   }],
   computedRewards: [{
-    minerUid: Number,
-    score: Number,
-    timestamp: Date,
+    minerUid: { type: Number },
+    score: { type: Number },
+    timestamp: { type: Date },
     _id: false
   }],
   metrics: {
-    totalQueryTime: Number,
-    averageRewardScore: Number,
-    successRate: Number,
-    failureCount: Number,
-    validFindings: Number
+    totalQueryTime: { type: Number },
+    averageRewardScore: { type: Number },
+    successRate: { type: Number },
+    failureCount: { type: Number },
+    validFindings: { type: Number }
   },
   subnetSnapshot: {
-    netuid: Number,
-    block: Number,
-    activeValidators: Number,
-    activeMiners: Number,
-    totalStake: Number,
-    emissionPerBlock: Number,
-    timestamp: Date
+    netuid: { type: Number },
+    block: { type: Number },
+    activeValidators: { type: Number },
+    activeMiners: { type: Number },
+    totalStake: { type: Number },
+    emissionPerBlock: { type: Number },
+    timestamp: { type: Date }
   },
   validationErrors: [{
-    stage: String,
-    message: String,
-    timestamp: Date,
-    stackTrace: String,
+    stage: { type: String },
+    message: { type: String },
+    timestamp: { type: Date },
+    stackTrace: { type: String },
     _id: false
   }],
   metadata: {
-    validatorAddress: String,
-    configVersion: String,
-    remarks: String
+    validatorAddress: { type: String },
+    configVersion: { type: String },
+    remarks: { type: String }
   }
 });
 
 const minerHistorySchema = new Schema<MinerHistoryDocument>({
   minerUid: { type: Number, required: true, index: true },
   sessionId: { type: String, required: true, index: true },
-  performanceScore: Number,
-  rewardScore: Number,
-  githubUrl: String,
-  findingsCount: Number,
-  accuracy: Number,
-  executionTime: Number,
+  performanceScore: { type: Number },
+  rewardScore: { type: Number },
+  githubUrl: { type: String },
+  findingsCount: { type: Number },
+  criticalFindingsCount: { type: Number },
+  accuracy: { type: Number },
+  executionTime: { type: Number },
   timestamp: { type: Date, default: Date.now, index: true },
   status: { type: String, enum: ['success', 'failed', 'timeout', 'error'] }
 });
@@ -377,11 +453,11 @@ const minerHistorySchema = new Schema<MinerHistoryDocument>({
 const rewardUpdateSchema = new Schema<RewardUpdateDocument>({
   updateId: { type: String, required: true, unique: true },
   sessionId: { type: String, required: true, index: true },
-  minerUids: [Number],
-  rewards: [Number],
+  minerUids: [{ type: Number }],
+  rewards: [{ type: Number }],
   timestamp: { type: Date, default: Date.now, index: true },
   confirmed: { type: Boolean, default: false },
-  confirmationTime: Date
+  confirmationTime: { type: Date }
 });
 
 validationSessionSchema.index({ timestamp: -1 });
@@ -408,7 +484,7 @@ const RewardUpdate: Model<RewardUpdateDocument> = mongoose.model(
 );
 
 // ─────────────────────────────────────────────────────────────
-// WRITE ENDPOINTS  (requireApiKey + writeLimiter on all)
+// WRITE ENDPOINTS
 // ─────────────────────────────────────────────────────────────
 
 /**
@@ -427,7 +503,6 @@ app.post(
         return;
       }
 
-      // Sanitize: ensure every element is a finite integer UID
       const cleanUids: number[] = sampledMinerUids
         .map((u: unknown) => Math.floor(Number(u)))
         .filter((u: number) => isFinite(u) && u >= 0);
@@ -437,7 +512,6 @@ app.post(
         return;
       }
 
-      // Cap to 256 miners per session to prevent abuse
       if (cleanUids.length > 256) {
         res.status(400).json({ success: false, error: 'sampledMinerUids exceeds maximum of 256' });
         return;
@@ -509,7 +583,6 @@ app.post(
             'challengeInfo.projectId': safeStr(projectId, 128),
             'challengeInfo.description': safeStr(description, 2048),
             'challengeInfo.difficulty': cleanDifficulty,
-            // rawData stored as-is but mongo-sanitize already stripped operators
             'challengeInfo.rawData': rawData || {},
             'challengeInfo.createdAt': new Date()
           }
@@ -532,6 +605,7 @@ app.post(
 
 /**
  * POST /api/validation/:sessionId/miner-response
+ * UPDATED: Now includes agentFindings
  */
 app.post(
   '/api/validation/:sessionId/miner-response',
@@ -541,7 +615,17 @@ app.post(
   async (req: Request, res: Response): Promise<void> => {
     try {
       const { sessionId } = req.params;
-      const { minerUid, githubUrl, responseTime, success, errorMessage, agentPerformance } = req.body;
+      const { 
+        minerUid, 
+        githubUrl, 
+        responseTime, 
+        success, 
+        errorMessage, 
+        agentPerformance,
+        agentFindings,
+        rewardScore,
+        rewardReason
+      } = req.body;
 
       const cleanUid = Math.floor(Number(minerUid));
       if (!isFinite(cleanUid) || cleanUid < 0) {
@@ -549,7 +633,6 @@ app.post(
         return;
       }
 
-      // Validate githubUrl is actually a GitHub URL
       let cleanGithubUrl: string | undefined;
       if (githubUrl) {
         try {
@@ -562,12 +645,15 @@ app.post(
         }
       }
 
-      const cleanResponseTime = safeNum(responseTime, 0, 3_600_000); // max 1 hour in ms
+      const cleanResponseTime = safeNum(responseTime, 0, 3_600_000);
 
       const VALID_STATUSES = ['completed', 'error', 'timeout', 'no_response'];
       const completionStatus = VALID_STATUSES.includes(agentPerformance?.completionStatus)
         ? agentPerformance.completionStatus
         : undefined;
+
+      // Validate and clean agent findings
+      const cleanAgentFindings = validateAgentFindings(agentFindings);
 
       const session = await ValidationSession.findOneAndUpdate(
         { sessionId },
@@ -586,8 +672,9 @@ app.post(
                 accuracy: safeNum(agentPerformance?.accuracy, 0, 1),
                 completionStatus
               },
-              rewardScore: isValidScore(req.body.rewardScore) ? req.body.rewardScore : undefined,
-              rewardReason: safeStr(req.body.rewardReason, 256)
+              agentFindings: cleanAgentFindings,
+              rewardScore: isValidScore(rewardScore) ? rewardScore : undefined,
+              rewardReason: safeStr(rewardReason, 256)
             }
           }
         },
@@ -599,7 +686,12 @@ app.post(
         return;
       }
 
-      res.json({ success: true, message: 'Miner response recorded', minerUid: cleanUid });
+      res.json({ 
+        success: true, 
+        message: 'Miner response recorded', 
+        minerUid: cleanUid,
+        findingsCount: cleanAgentFindings?.findingsCount ?? 0
+      });
     } catch (error: any) {
       console.error('Error in POST /api/validation/:sessionId/miner-response:', error);
       res.status(500).json({ success: false, error: 'Internal server error' });
@@ -609,6 +701,7 @@ app.post(
 
 /**
  * POST /api/validation/:sessionId/miner-reward
+ * UPDATED: Records findings count in history
  */
 app.post(
   '/api/validation/:sessionId/miner-reward',
@@ -631,31 +724,49 @@ app.post(
         return;
       }
 
-      const session = await ValidationSession.findOneAndUpdate(
+      const session = await ValidationSession.findOne({ sessionId });
+      if (!session) {
+        res.status(404).json({ success: false, error: 'Session not found' });
+        return;
+      }
+
+      // Find the miner response to get findings count
+      const minerResponse = session.minerResponses.find((r: any) => r.minerUid === cleanUid);
+      const findingsCount = minerResponse?.agentFindings?.findingsCount || 0;
+      const criticalFindingsCount = minerResponse?.agentFindings?.criticalCount || 0;
+
+      // Update miner response with reward
+      await ValidationSession.findOneAndUpdate(
         { sessionId, 'minerResponses.minerUid': cleanUid },
         {
           $set: {
             'minerResponses.$.rewardScore': rewardScore,
             'minerResponses.$.rewardReason': safeStr(rewardReason, 256)
           }
-        },
-        { new: true }
+        }
       );
 
-      if (!session) {
-        res.status(404).json({ success: false, error: 'Session or miner response not found' });
-        return;
-      }
-
+      // Record in history with findings data
       await MinerHistory.create({
         minerUid: cleanUid,
         sessionId,
         rewardScore,
+        findingsCount,
+        criticalFindingsCount,
+        githubUrl: minerResponse?.githubUrl,
+        accuracy: minerResponse?.agentPerformance?.accuracy,
+        executionTime: minerResponse?.agentPerformance?.executionTime,
         timestamp: new Date(),
         status: rewardScore > 0 ? 'success' : 'failed'
       });
 
-      res.json({ success: true, message: 'Reward recorded', minerUid: cleanUid, rewardScore });
+      res.json({ 
+        success: true, 
+        message: 'Reward recorded', 
+        minerUid: cleanUid, 
+        rewardScore,
+        findingsCount 
+      });
     } catch (error: any) {
       console.error('Error in POST /api/validation/:sessionId/miner-reward:', error);
       res.status(500).json({ success: false, error: 'Internal server error' });
@@ -691,7 +802,6 @@ app.post(
         return;
       }
 
-      // Sanitize every value
       const cleanUids = minerUids.map((u: unknown) => Math.floor(Number(u)));
       const cleanRewards = rewards.map((r: unknown) => {
         const n = Number(r);
@@ -808,7 +918,6 @@ app.post(
               stage: cleanStage,
               message: safeStr(message, 1024),
               timestamp: new Date(),
-              // Strip stack traces in production — they can leak internal paths
               stackTrace: process.env.NODE_ENV !== 'production'
                 ? safeStr(stackTrace, 4096)
                 : undefined
@@ -867,7 +976,176 @@ app.post(
 );
 
 // ─────────────────────────────────────────────────────────────
-// READ ENDPOINTS  (readLimiter only — public dashboard data)
+// READ ENDPOINTS - FINDINGS QUERIES (NEW)
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * GET /api/validation/:sessionId/findings
+ * Get all findings for a validation session grouped by miner
+ */
+app.get('/api/validation/:sessionId/findings', readLimiter, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId } = req.params;
+    
+    const session = await ValidationSession.findOne(
+      { sessionId },
+      { minerResponses: 1, projectId: 1, timestamp: 1 }
+    );
+
+    if (!session) {
+      res.status(404).json({ success: false, error: 'Session not found' });
+      return;
+    }
+
+    const findingsByMiner = (session.minerResponses || [])
+      .filter((r: any) => r.agentFindings && r.agentFindings.findingsCount > 0)
+      .map((r: any) => ({
+        minerUid: r.minerUid,
+        githubUrl: r.githubUrl,
+        findingsCount: r.agentFindings.findingsCount,
+        severityBreakdown: {
+          critical: r.agentFindings.criticalCount,
+          high: r.agentFindings.highCount,
+          medium: r.agentFindings.mediumCount,
+          low: r.agentFindings.lowCount
+        },
+        findings: r.agentFindings.findings,
+        rewardScore: r.rewardScore,
+        timestamp: r.timestamp
+      }));
+
+    const totalFindings = findingsByMiner.reduce((acc: number, m: any) => acc + m.findingsCount, 0);
+    const criticalFindings = findingsByMiner.reduce((acc: number, m: any) => acc + m.severityBreakdown.critical, 0);
+
+    res.json({ 
+      success: true, 
+      data: {
+        sessionId,
+        projectId: session.projectId,
+        timestamp: session.timestamp,
+        summary: {
+          totalFindings,
+          criticalFindings,
+          minersWithFindings: findingsByMiner.length
+        },
+        findingsByMiner
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/findings/critical
+ * Get all critical findings across all sessions
+ */
+app.get('/api/findings/critical', readLimiter, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 500);
+
+    const sessions = await ValidationSession.aggregate([
+      {
+        $unwind: '$minerResponses'
+      },
+      {
+        $match: {
+          'minerResponses.agentFindings.criticalCount': { $gt: 0 }
+        }
+      },
+      {
+        $project: {
+          sessionId: 1,
+          projectId: 1,
+          timestamp: 1,
+          minerUid: '$minerResponses.minerUid',
+          githubUrl: '$minerResponses.githubUrl',
+          rewardScore: '$minerResponses.rewardScore',
+          criticalFindings: {
+            $filter: {
+              input: '$minerResponses.agentFindings.findings',
+              as: 'f',
+              cond: { $eq: ['$$f.severity', 'critical'] }
+            }
+          }
+        }
+      },
+      { $sort: { timestamp: -1 } },
+      { $limit: limit }
+    ]);
+
+    res.json({ 
+      success: true, 
+      data: sessions.map((s: any, idx: number) => ({
+        rank: idx + 1,
+        sessionId: s.sessionId,
+        projectId: s.projectId,
+        minerUid: s.minerUid,
+        githubUrl: s.githubUrl,
+        rewardScore: s.rewardScore,
+        criticalFindingCount: s.criticalFindings.length,
+        findings: s.criticalFindings,
+        timestamp: s.timestamp
+      }))
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+/**
+ * GET /api/findings/severity-distribution
+ * Get distribution of findings by severity
+ */
+app.get('/api/findings/severity-distribution', readLimiter, async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { timeRange = '30d' } = req.query;
+    const since = new Date();
+    
+    if (timeRange === '24h') since.setHours(since.getHours() - 24);
+    else if (timeRange === '7d') since.setDate(since.getDate() - 7);
+    else since.setDate(since.getDate() - 30);
+
+    const distribution = await ValidationSession.aggregate([
+      {
+        $match: { timestamp: { $gte: since } }
+      },
+      {
+        $unwind: '$minerResponses'
+      },
+      {
+        $match: { 'minerResponses.agentFindings': { $exists: true } }
+      },
+      {
+        $group: {
+          _id: null,
+          criticalCount: { $sum: '$minerResponses.agentFindings.criticalCount' },
+          highCount: { $sum: '$minerResponses.agentFindings.highCount' },
+          mediumCount: { $sum: '$minerResponses.agentFindings.mediumCount' },
+          lowCount: { $sum: '$minerResponses.agentFindings.lowCount' },
+          totalFindings: { $sum: '$minerResponses.agentFindings.findingsCount' }
+        }
+      }
+    ]);
+
+    res.json({
+      success: true,
+      timeRange,
+      data: distribution[0] || {
+        criticalCount: 0,
+        highCount: 0,
+        mediumCount: 0,
+        lowCount: 0,
+        totalFindings: 0
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────
+// READ ENDPOINTS - EXISTING
 // ─────────────────────────────────────────────────────────────
 
 app.get('/api/validation/:sessionId', readLimiter, async (req: Request, res: Response): Promise<void> => {
@@ -886,14 +1164,14 @@ app.get('/api/validation/:sessionId', readLimiter, async (req: Request, res: Res
 
 app.get('/api/validation/sessions/recent', readLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
-    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100); // cap at 100
-    const skip  = Math.max(parseInt(req.query.skip as string) || 0, 0);
+    const limit = Math.min(parseInt(req.query.limit as string) || 20, 100);
+    const skip = Math.max(parseInt(req.query.skip as string) || 0, 0);
 
     const sessions = await ValidationSession.find()
       .sort({ timestamp: -1 })
       .limit(limit)
       .skip(skip)
-      .select('-challengeInfo.rawData -validationErrors.stackTrace'); // strip internal fields
+      .select('-challengeInfo.rawData -validationErrors.stackTrace');
 
     const total = await ValidationSession.countDocuments();
 
@@ -907,21 +1185,21 @@ app.get('/api/validation/sessions/stats', readLimiter, async (req: Request, res:
   try {
     const { timeRange = '24h' } = req.query;
     const startDate = new Date();
-    if (timeRange === '7d')       startDate.setDate(startDate.getDate() - 7);
+    if (timeRange === '7d') startDate.setDate(startDate.getDate() - 7);
     else if (timeRange === '30d') startDate.setDate(startDate.getDate() - 30);
-    else                          startDate.setHours(startDate.getHours() - 24);
+    else startDate.setHours(startDate.getHours() - 24);
 
     const stats = await ValidationSession.aggregate([
       { $match: { timestamp: { $gte: startDate } } },
       {
         $group: {
           _id: null,
-          totalSessions:      { $sum: 1 },
-          completedSessions:  { $sum: { $cond: [{ $eq: ['$state', 'completed'] }, 1, 0] } },
-          failedSessions:     { $sum: { $cond: [{ $eq: ['$state', 'failed'] }, 1, 0] } },
-          avgRewardScore:     { $avg: '$metrics.averageRewardScore' },
+          totalSessions: { $sum: 1 },
+          completedSessions: { $sum: { $cond: [{ $eq: ['$state', 'completed'] }, 1, 0] } },
+          failedSessions: { $sum: { $cond: [{ $eq: ['$state', 'failed'] }, 1, 0] } },
+          avgRewardScore: { $avg: '$metrics.averageRewardScore' },
           totalMinersQueried: { $sum: '$sampledMinerCount' },
-          avgQueryTime:       { $avg: '$metrics.totalQueryTime' }
+          avgQueryTime: { $avg: '$metrics.totalQueryTime' }
         }
       }
     ]);
@@ -954,18 +1232,28 @@ app.get('/api/miners/:minerUid/history', readLimiter, async (req: Request, res: 
       {
         $group: {
           _id: null,
-          avgReward:           { $avg: '$rewardScore' },
+          avgReward: { $avg: '$rewardScore' },
           totalParticipations: { $sum: 1 },
-          successCount:        { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
-          failureCount:        { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } },
-          avgAccuracy:         { $avg: '$accuracy' }
+          successCount: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
+          failureCount: { $sum: { $cond: [{ $eq: ['$status', 'failed'] }, 1, 0] } },
+          avgAccuracy: { $avg: '$accuracy' },
+          totalFindingsDiscovered: { $sum: '$findingsCount' },
+          totalCriticalFindings: { $sum: '$criticalFindingsCount' }
         }
       }
     ]);
 
     res.json({
       success: true, minerUid: minerIdNum, history,
-      stats: stats[0] || { avgReward: 0, totalParticipations: 0, successCount: 0, failureCount: 0, avgAccuracy: 0 }
+      stats: stats[0] || { 
+        avgReward: 0, 
+        totalParticipations: 0, 
+        successCount: 0, 
+        failureCount: 0, 
+        avgAccuracy: 0,
+        totalFindingsDiscovered: 0,
+        totalCriticalFindings: 0
+      }
     });
   } catch (error: any) {
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -978,20 +1266,22 @@ app.get('/api/leaderboard', readLimiter, async (req: Request, res: Response): Pr
     const { timeRange = '30d' } = req.query;
 
     const startDate = new Date();
-    if (timeRange === '24h')     startDate.setHours(startDate.getHours() - 24);
+    if (timeRange === '24h') startDate.setHours(startDate.getHours() - 24);
     else if (timeRange === '7d') startDate.setDate(startDate.getDate() - 7);
-    else                         startDate.setDate(startDate.getDate() - 30);
+    else startDate.setDate(startDate.getDate() - 30);
 
     const leaderboard = await MinerHistory.aggregate([
       { $match: { timestamp: { $gte: startDate } } },
       {
         $group: {
           _id: '$minerUid',
-          totalRewards:       { $sum: '$rewardScore' },
-          avgReward:          { $avg: '$rewardScore' },
+          totalRewards: { $sum: '$rewardScore' },
+          avgReward: { $avg: '$rewardScore' },
           participationCount: { $sum: 1 },
-          successCount:       { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
-          avgAccuracy:        { $avg: '$accuracy' }
+          successCount: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
+          avgAccuracy: { $avg: '$accuracy' },
+          totalFindingsDiscovered: { $sum: '$findingsCount' },
+          totalCriticalFindings: { $sum: '$criticalFindingsCount' }
         }
       },
       { $sort: { totalRewards: -1 } },
@@ -1001,13 +1291,15 @@ app.get('/api/leaderboard', readLimiter, async (req: Request, res: Response): Pr
     res.json({
       success: true, timeRange,
       leaderboard: leaderboard.map((entry: any, idx: number) => ({
-        rank:               idx + 1,
-        minerUid:           entry._id,
-        totalRewards:       entry.totalRewards,
-        avgReward:          Number(entry.avgReward?.toFixed(4)) || 0,
+        rank: idx + 1,
+        minerUid: entry._id,
+        totalRewards: entry.totalRewards,
+        avgReward: Number(entry.avgReward?.toFixed(4)) || 0,
         participationCount: entry.participationCount,
-        successRate:        Number(((entry.successCount / entry.participationCount) * 100).toFixed(2)) + '%',
-        avgAccuracy:        entry.avgAccuracy?.toFixed(4) || 'N/A'
+        successRate: Number(((entry.successCount / entry.participationCount) * 100).toFixed(2)) + '%',
+        avgAccuracy: entry.avgAccuracy?.toFixed(4) || 'N/A',
+        findingsDiscovered: entry.totalFindingsDiscovered || 0,
+        criticalFindings: entry.totalCriticalFindings || 0
       }))
     });
   } catch (error: any) {
@@ -1026,20 +1318,28 @@ app.get('/api/project/:projectId/summary', readLimiter, async (req: Request, res
     const sessions = await ValidationSession.find({ projectId }).sort({ timestamp: -1 })
       .select('-challengeInfo.rawData');
 
+    const totalFindings = sessions.reduce((acc: number, s: any) => {
+      return acc + (s.minerResponses || []).reduce((minerAcc: number, r: any) => {
+        return minerAcc + (r.agentFindings?.findingsCount || 0);
+      }, 0);
+    }, 0);
+
     const summary = {
       projectId,
       totalValidationRuns: sessions.length,
-      successfulRuns:      sessions.filter((s: any) => s.state === 'completed').length,
-      failedRuns:          sessions.filter((s: any) => s.state === 'failed').length,
-      totalMinersQueried:  sessions.reduce((acc: number, s: any) => acc + (s.sampledMinerCount || 0), 0),
-      avgRewardScore:      sessions.reduce((acc: number, s: any) => acc + (s.metrics?.averageRewardScore || 0), 0) / (sessions.length || 1),
-      lastRun:             sessions[0]?.timestamp || null,
+      successfulRuns: sessions.filter((s: any) => s.state === 'completed').length,
+      failedRuns: sessions.filter((s: any) => s.state === 'failed').length,
+      totalMinersQueried: sessions.reduce((acc: number, s: any) => acc + (s.sampledMinerCount || 0), 0),
+      avgRewardScore: sessions.reduce((acc: number, s: any) => acc + (s.metrics?.averageRewardScore || 0), 0) / (sessions.length || 1),
+      totalFindingsDiscovered: totalFindings,
+      lastRun: sessions[0]?.timestamp || null,
       sessions: sessions.map((s: any) => ({
-        sessionId:        s.sessionId,
-        timestamp:        s.timestamp,
-        state:            s.state,
+        sessionId: s.sessionId,
+        timestamp: s.timestamp,
+        state: s.state,
         sampledMinerCount: s.sampledMinerCount,
-        avgRewardScore:   s.metrics?.averageRewardScore
+        avgRewardScore: s.metrics?.averageRewardScore,
+        findingsCount: (s.minerResponses || []).reduce((acc: number, r: any) => acc + (r.agentFindings?.findingsCount || 0), 0)
       }))
     };
 
@@ -1049,14 +1349,13 @@ app.get('/api/project/:projectId/summary', readLimiter, async (req: Request, res
   }
 });
 
-// Network dashboard endpoints
 app.get('/api/network/stats', readLimiter, async (req: Request, res: Response): Promise<void> => {
   try {
     const { window: tw = '24h' } = req.query;
     const since = new Date();
-    if (tw === '7d')       since.setDate(since.getDate() - 7);
+    if (tw === '7d') since.setDate(since.getDate() - 7);
     else if (tw === '30d') since.setDate(since.getDate() - 30);
-    else                   since.setHours(since.getHours() - 24);
+    else since.setHours(since.getHours() - 24);
 
     const latestSession = await ValidationSession
       .findOne({ 'subnetSnapshot.block': { $exists: true } })
@@ -1073,13 +1372,20 @@ app.get('/api/network/stats', readLimiter, async (req: Request, res: Response): 
       { $group: { _id: null, avgAccuracy: { $avg: '$rewardScore' } } }
     ]);
 
+    const findingsAgg = await MinerHistory.aggregate([
+      { $match: { timestamp: { $gte: since } } },
+      { $group: { _id: null, totalFindings: { $sum: '$findingsCount' }, criticalFindings: { $sum: '$criticalFindingsCount' } } }
+    ]);
+
     res.json({
       success: true,
       data: {
         activeValidators: snap?.activeValidators ?? 0,
-        activeMiners:     snap?.activeMiners     ?? 0,
+        activeMiners: snap?.activeMiners ?? 0,
         dailyAudits,
-        avgAccuracy: Number((accAgg[0]?.avgAccuracy ?? 0).toFixed(4))
+        avgAccuracy: Number((accAgg[0]?.avgAccuracy ?? 0).toFixed(4)),
+        totalFindingsDiscovered: findingsAgg[0]?.totalFindings ?? 0,
+        criticalFindingsDiscovered: findingsAgg[0]?.criticalFindings ?? 0
       }
     });
   } catch (error: any) {
@@ -1093,20 +1399,21 @@ app.get('/api/network/agents', readLimiter, async (req: Request, res: Response):
     const { timeRange = '30d' } = req.query;
 
     const since = new Date();
-    if (timeRange === '24h')     since.setHours(since.getHours() - 24);
+    if (timeRange === '24h') since.setHours(since.getHours() - 24);
     else if (timeRange === '7d') since.setDate(since.getDate() - 7);
-    else                         since.setDate(since.getDate() - 30);
+    else since.setDate(since.getDate() - 30);
 
     const agentStats = await MinerHistory.aggregate([
       { $match: { timestamp: { $gte: since } } },
       {
         $group: {
           _id: '$minerUid',
-          avgReward:          { $avg: '$rewardScore' },
-          totalReward:        { $sum: '$rewardScore' },
+          avgReward: { $avg: '$rewardScore' },
+          totalReward: { $sum: '$rewardScore' },
           participationCount: { $sum: 1 },
-          successCount:       { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
-          latestSessionId:    { $last: '$sessionId' }
+          successCount: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
+          latestSessionId: { $last: '$sessionId' },
+          totalFindingsDiscovered: { $sum: '$findingsCount' }
         }
       },
       { $sort: { avgReward: -1 } },
@@ -1122,19 +1429,20 @@ app.get('/api/network/agents', readLimiter, async (req: Request, res: Response):
     for (const s of sessions) sessionMap[(s as any).sessionId] = s;
 
     const agents = agentStats.map((entry: any, idx: number) => {
-      const sess     = sessionMap[entry.latestSessionId];
+      const sess = sessionMap[entry.latestSessionId];
       const minerResp = sess?.minerResponses?.find((r: any) => r.minerUid === entry._id);
       const successRate = entry.participationCount > 0
         ? (entry.successCount / entry.participationCount) * 100 : 0;
 
       return {
-        rank:      idx + 1,
-        minerUid:  entry._id,
-        agent:     minerResp?.githubUrl ?? null,
+        rank: idx + 1,
+        minerUid: entry._id,
+        agent: minerResp?.githubUrl ?? null,
         benchmark: Number((entry.avgReward * 100).toFixed(2)),
         incentive: Number(entry.totalReward.toFixed(6)),
-        emission:  entry.participationCount,
-        consensus: Number(successRate.toFixed(2))
+        emission: entry.participationCount,
+        consensus: Number(successRate.toFixed(2)),
+        findingsDiscovered: entry.totalFindingsDiscovered || 0
       };
     });
 
@@ -1167,16 +1475,16 @@ app.get('/api/network/throughput', readLimiter, async (req: Request, res: Respon
         $group: {
           _id: { $subtract: [{ $toLong: '$timestamp' }, { $mod: [{ $toLong: '$timestamp' }, bucketMs] }] },
           completedSessions: { $sum: 1 },
-          avgRewardScore:    { $avg: '$metrics.averageRewardScore' }
+          avgRewardScore: { $avg: '$metrics.averageRewardScore' }
         }
       },
       { $sort: { _id: 1 } },
       {
         $project: {
           _id: 0,
-          timestamp:         { $toDate: '$_id' },
+          timestamp: { $toDate: '$_id' },
           completedSessions: 1,
-          avgRewardScore:    { $ifNull: ['$avgRewardScore', 0] }
+          avgRewardScore: { $ifNull: ['$avgRewardScore', 0] }
         }
       }
     ]);
@@ -1196,7 +1504,6 @@ app.get('/api/health', (_req: Request, res: Response): void => {
 // =====================
 
 app.use((err: any, _req: Request, res: Response, _next: NextFunction): void => {
-  // Don't leak error details in production
   const message = process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message;
   console.error('Unhandled error:', err);
   res.status(500).json({ success: false, error: message });
@@ -1204,7 +1511,6 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction): void => {
 
 app.use((req: Request, res: Response): void => {
   res.status(404).json({ success: false, error: 'Endpoint not found' });
-  // Note: path intentionally omitted — avoids reflecting arbitrary input back
 });
 
 // =====================
