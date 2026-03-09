@@ -1413,7 +1413,7 @@ app.get('/api/network/agents', readLimiter, async (req: Request, res: Response):
           participationCount: { $sum: 1 },
           successCount: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
           latestSessionId: { $last: '$sessionId' },
-          totalFindingsDiscovered: { $sum: '$findingsCount' }
+          totalFindingsDiscovered: { $sum: '$findingsCount' },
         }
       },
       { $sort: { avgReward: -1 } },
@@ -1544,5 +1544,679 @@ process.on('SIGTERM', async () => {
   await mongoose.disconnect();
   process.exit(0);
 });
+export const getValidators = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { timeRange = '30d' } = req.query;
+    const since = new Date();
+    if (timeRange === '24h') since.setHours(since.getHours() - 24);
+    else if (timeRange === '7d') since.setDate(since.getDate() - 7);
+    else since.setDate(since.getDate() - 30);
+
+    const validators = await ValidationSession.aggregate([
+      { $match: { timestamp: { $gte: since } } },
+      {
+        $group: {
+          _id: '$metadata.validatorAddress',
+          sessionsSubmitted: { $sum: 1 },
+          completedSessions: {
+            $sum: { $cond: [{ $eq: ['$state', 'completed'] }, 1, 0] }
+          },
+          avgRewardScore: { $avg: '$metrics.averageRewardScore' },
+          lastSubmissionTs: { $max: '$timestamp' },
+          configVersions: { $addToSet: '$metadata.configVersion' },
+          totalMinersQueried: { $sum: '$sampledMinerCount' }
+        }
+      },
+      { $sort: { sessionsSubmitted: -1 } }
+    ]);
+
+    res.json({
+      success: true,
+      timeRange,
+      data: validators.map((v: any) => ({
+        validatorAddress: v._id ?? 'unknown',
+        sessionsSubmitted: v.sessionsSubmitted,
+        completedSessions: v.completedSessions,
+        successRate: v.sessionsSubmitted > 0
+          ? Number(((v.completedSessions / v.sessionsSubmitted) * 100).toFixed(2))
+          : 0,
+        avgRewardScore: Number((v.avgRewardScore ?? 0).toFixed(4)),
+        totalMinersQueried: v.totalMinersQueried,
+        lastSubmissionTs: v.lastSubmissionTs,
+        active: v.lastSubmissionTs > new Date(Date.now() - 24 * 60 * 60 * 1000),
+        configVersions: v.configVersions.filter(Boolean)
+      }))
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 2. GET /api/validators/:validatorAddress
+//    Single validator detail + session history
+// ─────────────────────────────────────────────────────────────
+export const getValidatorDetail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { validatorAddress } = req.params;
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const skip = Math.max(parseInt(req.query.skip as string) || 0, 0);
+
+    const [sessions, stats] = await Promise.all([
+      ValidationSession.find({ 'metadata.validatorAddress': validatorAddress })
+        .sort({ timestamp: -1 })
+        .limit(limit)
+        .skip(skip)
+        .select('-challengeInfo.rawData -validationErrors.stackTrace')
+        .lean(),
+
+      ValidationSession.aggregate([
+        { $match: { 'metadata.validatorAddress': validatorAddress } },
+        {
+          $group: {
+            _id: null,
+            totalSessions: { $sum: 1 },
+            completedSessions: {
+              $sum: { $cond: [{ $eq: ['$state', 'completed'] }, 1, 0] }
+            },
+            // True mean: weight each session's mean by its miner count
+            totalWeightedScore: {
+              $sum: {
+                $multiply: [
+                  { $ifNull: ['$metrics.averageRewardScore', 0] },
+                  { $ifNull: ['$sampledMinerCount', 1] }
+                ]
+              }
+            },
+            totalMinersQueried: { $sum: '$sampledMinerCount' },
+            firstSeen: { $min: '$timestamp' },
+            lastSeen: { $max: '$timestamp' }
+          }
+        }
+      ])
+    ]);
+
+    if (!stats.length) {
+      res.status(404).json({ success: false, error: 'Validator not found' });
+      return;
+    }
+
+    const s = stats[0];
+    const trueAvgScore = s.totalMinersQueried > 0
+      ? s.totalWeightedScore / s.totalMinersQueried
+      : 0;
+
+    res.json({
+      success: true,
+      data: {
+        validatorAddress,
+        totalSessions: s.totalSessions,
+        completedSessions: s.completedSessions,
+        successRate: Number(((s.completedSessions / s.totalSessions) * 100).toFixed(2)),
+        trueAvgRewardScore: Number(trueAvgScore.toFixed(4)),
+        totalMinersQueried: s.totalMinersQueried,
+        firstSeen: s.firstSeen,
+        lastSeen: s.lastSeen,
+        active: s.lastSeen > new Date(Date.now() - 24 * 60 * 60 * 1000),
+        sessions
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 3. GET /api/submissions
+//    Filterable across all sessions
+//    ?minerUid=&validator=&state=&challengeId=&limit=&skip=
+// ─────────────────────────────────────────────────────────────
+export const getSubmissions = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const skip  = Math.max(parseInt(req.query.skip  as string) || 0,  0);
+
+    const filter: Record<string, any> = {};
+
+    if (req.query.state)       filter.state = req.query.state;
+    if (req.query.validator)   filter['metadata.validatorAddress'] = req.query.validator;
+    if (req.query.challengeId) filter['challengeInfo.projectId'] = req.query.challengeId;
+
+    // minerUid filter requires matching inside the embedded array
+    const minerUid = req.query.minerUid
+      ? Math.floor(Number(req.query.minerUid))
+      : null;
+
+    let pipeline: any[] = [
+      { $match: filter },
+      { $sort: { timestamp: -1 } },
+      { $skip: skip },
+      { $limit: limit },
+      {
+        $project: {
+          sessionId: 1,
+          challengeId: '$challengeInfo.projectId',
+          validatorAddress: '$metadata.validatorAddress',
+          state: 1,
+          sampledMinerCount: 1,
+          createdAt: '$timestamp',
+          completedAt: 1,
+          'metrics.averageRewardScore': 1,
+          'metrics.successRate': 1,
+          'metrics.failureCount': 1,
+          minerResponses: minerUid
+            ? {
+                $filter: {
+                  input: '$minerResponses',
+                  as: 'r',
+                  cond: { $eq: ['$$r.minerUid', minerUid] }
+                }
+              }
+            : '$minerResponses'
+        }
+      }
+    ];
+
+    const [sessions, total] = await Promise.all([
+      ValidationSession.aggregate(pipeline),
+      ValidationSession.countDocuments(filter)
+    ]);
+
+    res.json({
+      success: true,
+      pagination: { total, limit, skip },
+      data: sessions.map((s: any) => {
+        const responses = s.minerResponses || [];
+        return {
+          sessionId: s.sessionId,
+          challengeId: s.challengeId,
+          validatorAddress: s.validatorAddress,
+          state: s.state,
+          sampledMinerCount: s.sampledMinerCount,
+          createdAt: s.createdAt,
+          completedAt: s.completedAt ?? null,
+          latencyMs: s.completedAt && s.createdAt
+            ? new Date(s.completedAt).getTime() - new Date(s.createdAt).getTime()
+            : null,
+          avgRewardScore: s.metrics?.averageRewardScore ?? null,
+          successRate: s.metrics?.successRate ?? null,
+          failureCount: s.metrics?.failureCount ?? null,
+          findingsCount: responses.reduce(
+            (acc: number, r: any) => acc + (r.agentFindings?.findingsCount || 0), 0
+          ),
+          criticalCount: responses.reduce(
+            (acc: number, r: any) => acc + (r.agentFindings?.criticalCount || 0), 0
+          ),
+          ...(minerUid !== null && responses.length > 0 ? {
+            minerUid,
+            rewardScore: responses[0]?.rewardScore ?? null,
+            githubUrl: responses[0]?.githubUrl ?? null,
+            responseTime: responses[0]?.responseTime ?? null,
+          } : {})
+        };
+      })
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 4. GET /api/challenges
+//    All unique projects/challenges with stats
+//    ?status=&difficulty=&limit=&skip=
+// ─────────────────────────────────────────────────────────────
+export const getChallenges = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 50, 200);
+    const skip  = Math.max(parseInt(req.query.skip  as string) || 0,  0);
+
+    const matchFilter: Record<string, any> = {
+      'challengeInfo.projectId': { $exists: true, $ne: null }
+    };
+    if (req.query.difficulty) {
+      matchFilter['challengeInfo.difficulty'] = req.query.difficulty;
+    }
+
+    const challenges = await ValidationSession.aggregate([
+      { $match: matchFilter },
+      {
+        $group: {
+          _id: '$challengeInfo.projectId',
+          title: { $first: '$challengeInfo.description' },
+          difficulty: { $first: '$challengeInfo.difficulty' },
+          // Pull repoUrl and commit out of rawData if present
+          repoUrl: { $first: '$challengeInfo.rawData.repo_url' },
+          commit:  { $first: '$challengeInfo.rawData.commit' },
+          submissionsCount: { $sum: 1 },
+          completedCount: {
+            $sum: { $cond: [{ $eq: ['$state', 'completed'] }, 1, 0] }
+          },
+          bestScore: { $max: '$metrics.averageRewardScore' },
+          firstSeen: { $min: '$timestamp' },
+          lastSeen:  { $max: '$timestamp' },
+          totalFindings: {
+            $sum: {
+              $reduce: {
+                input: '$minerResponses',
+                initialValue: 0,
+                in: { $add: ['$$value', { $ifNull: ['$$this.agentFindings.findingsCount', 0] }] }
+              }
+            }
+          }
+        }
+      },
+      { $sort: { lastSeen: -1 } },
+      { $skip: skip },
+      { $limit: limit }
+    ]);
+
+    // Apply status filter in memory (derived field)
+    let filtered = challenges;
+    if (req.query.status === 'active') {
+      const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      filtered = challenges.filter((c: any) => new Date(c.lastSeen) >= cutoff);
+    } else if (req.query.status === 'inactive') {
+      const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      filtered = challenges.filter((c: any) => new Date(c.lastSeen) < cutoff);
+    }
+
+    res.json({
+      success: true,
+      pagination: { total: filtered.length, limit, skip },
+      data: filtered.map((c: any) => ({
+        challengeId: c._id,
+        title: c.title ?? c._id,
+        repoUrl: c.repoUrl ?? null,
+        commit: c.commit ?? null,
+        difficulty: c.difficulty ?? null,
+        status: new Date(c.lastSeen) >= new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+          ? 'active' : 'inactive',
+        submissionsCount: c.submissionsCount,
+        completedCount: c.completedCount,
+        bestScore: c.bestScore != null ? Number(c.bestScore.toFixed(4)) : null,
+        totalFindingsDiscovered: c.totalFindings,
+        firstSeen: c.firstSeen,
+        lastSeen: c.lastSeen
+      }))
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 5. GET /api/challenges/:challengeId
+//    Single challenge detail + best miners for it
+// ─────────────────────────────────────────────────────────────
+export const getChallengeDetail = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { challengeId } = req.params;
+
+    const sessions = await ValidationSession.find(
+      { 'challengeInfo.projectId': challengeId },
+      { minerResponses: 1, state: 1, timestamp: 1, completedAt: 1, metrics: 1, metadata: 1, challengeInfo: 1 }
+    ).sort({ timestamp: -1 }).lean();
+
+    if (!sessions.length) {
+      res.status(404).json({ success: false, error: 'Challenge not found' });
+      return;
+    }
+
+    const first = sessions[0] as any;
+
+    // Top miners for this challenge
+    const minerMap: Record<number, { scores: number[]; findings: number; critical: number }> = {};
+    for (const s of sessions) {
+      for (const r of (s as any).minerResponses || []) {
+        if (!minerMap[r.minerUid]) {
+          minerMap[r.minerUid] = { scores: [], findings: 0, critical: 0 };
+        }
+        if (r.rewardScore != null) minerMap[r.minerUid].scores.push(r.rewardScore);
+        minerMap[r.minerUid].findings += r.agentFindings?.findingsCount || 0;
+        minerMap[r.minerUid].critical += r.agentFindings?.criticalCount || 0;
+      }
+    }
+
+    const topMiners = Object.entries(minerMap)
+      .map(([uid, data]) => ({
+        minerUid: Number(uid),
+        avgScore: data.scores.length
+          ? Number((data.scores.reduce((a, b) => a + b, 0) / data.scores.length).toFixed(4))
+          : 0,
+        bestScore: data.scores.length ? Number(Math.max(...data.scores).toFixed(4)) : 0,
+        participations: data.scores.length,
+        totalFindings: data.findings,
+        criticalFindings: data.critical
+      }))
+      .sort((a, b) => b.bestScore - a.bestScore)
+      .slice(0, 20);
+
+    res.json({
+      success: true,
+      data: {
+        challengeId,
+        title: first.challengeInfo?.description ?? challengeId,
+        repoUrl: first.challengeInfo?.rawData?.repo_url ?? null,
+        commit: first.challengeInfo?.rawData?.commit ?? null,
+        difficulty: first.challengeInfo?.difficulty ?? null,
+        submissionsCount: sessions.length,
+        completedCount: sessions.filter((s: any) => s.state === 'completed').length,
+        bestScore: topMiners.length ? topMiners[0].bestScore : null,
+        firstSeen: sessions[sessions.length - 1]?.timestamp,
+        lastSeen: sessions[0]?.timestamp,
+        topMiners
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 6. GET /api/sessions/:sessionId/report
+//    Full findings report for a session (all miners)
+//    Replaces /api/validation/:sessionId/findings with richer shape
+// ─────────────────────────────────────────────────────────────
+export const getSessionReport = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId } = req.params;
+
+    const session = await ValidationSession.findOne(
+      { sessionId },
+      {
+        sessionId: 1, projectId: 1, timestamp: 1, completedAt: 1,
+        state: 1, 'challengeInfo.projectId': 1, 'metadata.validatorAddress': 1,
+        minerResponses: 1
+      }
+    ).lean();
+
+    if (!session) {
+      res.status(404).json({ success: false, error: 'Session not found' });
+      return;
+    }
+
+    const s = session as any;
+
+    const findingsByMiner = (s.minerResponses || [])
+      .filter((r: any) => r.agentFindings?.findingsCount > 0)
+      .map((r: any) => ({
+        minerUid: r.minerUid,
+        githubUrl: r.githubUrl ?? null,
+        rewardScore: r.rewardScore ?? null,
+        findingsCount: r.agentFindings.findingsCount,
+        severityBreakdown: {
+          critical: r.agentFindings.criticalCount,
+          high:     r.agentFindings.highCount,
+          medium:   r.agentFindings.mediumCount,
+          low:      r.agentFindings.lowCount
+        },
+        findings: (r.agentFindings.findings || []).map((f: any) => ({
+          id:          f.id,
+          title:       f.title,
+          severity:    f.severity,
+          description: f.description ?? null,
+          file:        f.codeLocation ?? null,
+          line:        null,   // not stored yet — add to agentFindingSchema when ready
+          confidence:  f.confidenceScore ?? null,
+          remediation: f.remediation ?? null,
+          // status: verified | unverified | false-positive
+          // not stored yet — needs a separate review endpoint to set this
+          status: 'unverified'
+        })),
+        timestamp: r.timestamp
+      }));
+
+    const totalFindings  = findingsByMiner.reduce((a: number, m: any) => a + m.findingsCount, 0);
+    const criticalTotal  = findingsByMiner.reduce((a: number, m: any) => a + m.severityBreakdown.critical, 0);
+
+    res.json({
+      success: true,
+      data: {
+        sessionId:        s.sessionId,
+        challengeId:      s.challengeInfo?.projectId ?? s.projectId,
+        validatorAddress: s.metadata?.validatorAddress,
+        state:            s.state,
+        createdAt:        s.timestamp,
+        completedAt:      s.completedAt ?? null,
+        summary: {
+          totalFindings,
+          criticalFindings:    criticalTotal,
+          minersWithFindings:  findingsByMiner.length,
+          minersTotal:         (s.minerResponses || []).length
+        },
+        findingsByMiner
+      }
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 7. PATCH /api/sessions/:sessionId/findings/:findingId/status
+//    Mark a finding as verified | false-positive | unverified
+//    (requires adding a `status` field to agentFindingSchema)
+// ─────────────────────────────────────────────────────────────
+export const updateFindingStatus = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId, findingId } = req.params;
+    const { status, reviewerAddress } = req.body;
+
+    const VALID_STATUSES = ['verified', 'false-positive', 'unverified'];
+    if (!VALID_STATUSES.includes(status)) {
+      res.status(400).json({ success: false, error: `status must be one of: ${VALID_STATUSES.join(', ')}` });
+      return;
+    }
+
+    const result = await ValidationSession.updateOne(
+      {
+        sessionId,
+        'minerResponses.agentFindings.findings.id': findingId
+      },
+      {
+        $set: {
+          'minerResponses.$[].agentFindings.findings.$[finding].status': status,
+          'minerResponses.$[].agentFindings.findings.$[finding].reviewedBy': reviewerAddress,
+          'minerResponses.$[].agentFindings.findings.$[finding].reviewedAt': new Date()
+        }
+      },
+      {
+        arrayFilters: [{ 'finding.id': findingId }]
+      }
+    );
+
+    if (result.matchedCount === 0) {
+      res.status(404).json({ success: false, error: 'Session or finding not found' });
+      return;
+    }
+
+    res.json({ success: true, findingId, status });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 8. DELETE /api/sessions/:sessionId
+//    Hard delete a session + its miner history entries
+// ─────────────────────────────────────────────────────────────
+export const deleteSession = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const { sessionId } = req.params;
+    const { validatorAddress } = req.body;
+
+    if (!validatorAddress) {
+      res.status(400).json({ success: false, error: 'validatorAddress required' });
+      return;
+    }
+
+    const session = await ValidationSession.findOne(
+      { sessionId },
+      { 'metadata.validatorAddress': 1 }
+    ).lean();
+
+    if (!session) {
+      res.status(404).json({ success: false, error: 'Session not found' });
+      return;
+    }
+
+    if ((session as any).metadata?.validatorAddress !== validatorAddress) {
+      res.status(403).json({ success: false, error: 'Forbidden' });
+      return;
+    }
+
+    await Promise.all([
+      ValidationSession.deleteOne({ sessionId }),
+      MinerHistory.deleteMany({ sessionId }),
+      RewardUpdate.deleteMany({ sessionId })
+    ]);
+
+    res.json({ success: true, message: 'Session deleted', sessionId });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 9. GET /api/miners/:minerUid/findings
+//    All findings ever discovered by a miner across all sessions
+// ─────────────────────────────────────────────────────────────
+export const getMinerFindings = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const minerUid = parseInt(req.params.minerUid);
+    if (!isFinite(minerUid) || minerUid < 0) {
+      res.status(400).json({ success: false, error: 'Invalid minerUid' });
+      return;
+    }
+
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+    const severity = req.query.severity as string | undefined;
+
+    const pipeline: any[] = [
+      { $match: { 'minerResponses.minerUid': minerUid } },
+      { $unwind: '$minerResponses' },
+      { $match: { 'minerResponses.minerUid': minerUid } },
+      { $unwind: '$minerResponses.agentFindings.findings' },
+      ...(severity ? [{ $match: { 'minerResponses.agentFindings.findings.severity': severity } }] : []),
+      {
+        $project: {
+          _id: 0,
+          sessionId: 1,
+          challengeId: '$challengeInfo.projectId',
+          timestamp: '$minerResponses.timestamp',
+          rewardScore: '$minerResponses.rewardScore',
+          finding: '$minerResponses.agentFindings.findings'
+        }
+      },
+      { $sort: { timestamp: -1 } },
+      { $limit: limit }
+    ];
+
+    const results = await ValidationSession.aggregate(pipeline);
+
+    res.json({
+      success: true,
+      minerUid,
+      count: results.length,
+      data: results
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// 10. GET /api/leaderboard/true-avg
+//     Leaderboard sorted by true weighted average score
+//     (fixes the existing sum-sorted leaderboard bias)
+// ─────────────────────────────────────────────────────────────
+export const getTrueAvgLeaderboard = async (req: Request, res: Response): Promise<void> => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit as string) || 100, 500);
+    const { timeRange = '30d' } = req.query;
+
+    const since = new Date();
+    if (timeRange === '24h') since.setHours(since.getHours() - 24);
+    else if (timeRange === '7d') since.setDate(since.getDate() - 7);
+    else since.setDate(since.getDate() - 30);
+
+    const leaderboard = await MinerHistory.aggregate([
+      { $match: { timestamp: { $gte: since } } },
+      {
+        $group: {
+          _id: '$minerUid',
+          avgReward: { $avg: '$rewardScore' },
+          totalReward: { $sum: '$rewardScore' },
+          participationCount: { $sum: 1 },
+          successCount: { $sum: { $cond: [{ $eq: ['$status', 'success'] }, 1, 0] } },
+          avgAccuracy: { $avg: '$accuracy' },
+          totalFindings: { $sum: '$findingsCount' },
+          criticalFindings: { $sum: '$criticalFindingsCount' },
+          lastActive: { $max: '$timestamp' }
+        }
+      },
+      // Sort by avgReward (not totalReward) — fairer ranking
+      { $sort: { avgReward: -1, participationCount: -1 } },
+      { $limit: limit }
+    ]);
+
+    res.json({
+      success: true,
+      timeRange,
+      leaderboard: leaderboard.map((e: any, i: number) => ({
+        rank:               i + 1,
+        minerUid:           e._id,
+        avgReward:          Number((e.avgReward ?? 0).toFixed(4)),
+        totalReward:        Number(e.totalReward.toFixed(4)),
+        participationCount: e.participationCount,
+        successRate:        Number(((e.successCount / e.participationCount) * 100).toFixed(2)) + '%',
+        avgAccuracy:        e.avgAccuracy != null ? Number(e.avgAccuracy.toFixed(4)) : null,
+        findingsDiscovered: e.totalFindings,
+        criticalFindings:   e.criticalFindings,
+        lastActive:         e.lastActive
+      }))
+    });
+  } catch (error: any) {
+    res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+};
+
+// ─────────────────────────────────────────────────────────────
+// ROUTE REGISTRATION
+// Add these lines to your main server file after existing routes
+// ─────────────────────────────────────────────────────────────
+
+/*
+// All GET routes need requireApiKey added — example:
+app.get('/api/validators',                          requireApiKey, readLimiter, getValidators);
+app.get('/api/validators/:validatorAddress',        requireApiKey, readLimiter, getValidatorDetail);
+app.get('/api/submissions',                         requireApiKey, readLimiter, getSubmissions);
+app.get('/api/challenges',                          requireApiKey, readLimiter, getChallenges);
+app.get('/api/challenges/:challengeId',             requireApiKey, readLimiter, getChallengeDetail);
+app.get('/api/sessions/:sessionId/report',          requireApiKey, readLimiter, getSessionReport);
+app.get('/api/miners/:minerUid/findings',           requireApiKey, readLimiter, getMinerFindings);
+app.get('/api/leaderboard/true-avg',                requireApiKey, readLimiter, getTrueAvgLeaderboard);
+
+app.patch('/api/sessions/:sessionId/findings/:findingId/status',
+                                                    requireApiKey, writeLimiter, updateFindingStatus);
+app.delete('/api/sessions/:sessionId',              requireApiKey, writeLimiter, deleteSession);
+
+// Also add requireApiKey to your existing unprotected GETs:
+// /api/validation/:sessionId
+// /api/validation/sessions/recent
+// /api/validation/sessions/stats
+// /api/miners/:minerUid/history
+// /api/leaderboard
+// /api/project/:projectId/summary
+// /api/network/stats
+// /api/network/agents
+// /api/network/throughput
+// /api/validation/:sessionId/findings
+// /api/findings/critical
+// /api/findings/severity-distribution
+*/
+
+
 
 export default app;
